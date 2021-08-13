@@ -1,16 +1,19 @@
 import os
-import os
 import argparse
 import logging
+import queue
 import exiftool
 import json
 import pprint
 import datetime
 import time
 import glob
+import multiprocessing
+import time
+
 
 logging_level = logging.DEBUG
-
+num_worker_processes = int(multiprocessing.cpu_count() * 1.0)
 
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="Copy RAW files to NAS")
@@ -72,7 +75,7 @@ def _enumerate_source_images(args, matching_file_extension):
 
 def _get_exif_datetimes( args, source_image_files ):
 
-    exiftool_tag_name = "EXIF:DateTimeOriginal"
+    time_start = time.perf_counter()
 
     file_data = {}
 
@@ -86,49 +89,100 @@ def _get_exif_datetimes( args, source_image_files ):
 
     start_time = time.perf_counter()
 
-    with exiftool.ExifTool(args.exiftool_path) as exiftool_handle:
+    process_handles = []
 
-        for (file_index, curr_image_file) in enumerate(source_image_files):
-            #logging.debug(f"Getting EXIF metadata for \"{curr_image_file}\"")
+    # Joinable Queue for sending files to process to children
+    files_to_process_queue = multiprocessing.Queue(maxsize=file_count)
 
-            absolute_path = curr_image_file['file_path']
+    # Queue that children use to write EXIF timestamp information data back to parent
+    processed_file_queue = multiprocessing.Queue(maxsize=file_count)
 
-            exif_datetime = exiftool_handle.get_tag(exiftool_tag_name, absolute_path)
 
-            #logging.debug( f"File \"{curr_image_file}\" has EXIF datetime \"{exif_datetime}\"")
+    for i in range(num_worker_processes):
+        process_handle = multiprocessing.Process( target=_exif_timestamp_worker,
+                                                  args=(i+1, files_to_process_queue,
+                                                        processed_file_queue,
+                                                        args) )
 
-            # Create legit datetime, not tz aware (yet)
-            file_datetime_no_tz = datetime.datetime.strptime( exif_datetime, "%Y:%m:%d %H:%M:%S")
+        process_handle.start()
+        #logging.debug(f"Parent back from start on child process {i+1}")
+        process_handles.append( process_handle )
 
-            #logging.debug( f"Parsed datetime: {file_datetime_no_tz.isoformat()}")
+    # Load up the queue with all the files to process
+    for curr_file_info in source_image_files:
+        #logging.debug(f"About to write {json.dumps(curr_file_info)} to the child queue")
+        files_to_process_queue.put(curr_file_info)
 
-            # Do hour shift from timezone-unaware EXIF datetime to UTC
-            shifted_datetime_no_tz = file_datetime_no_tz + datetime.timedelta(
-                hours=-(args.file_timestamp_utc_offset_hours))
+    # We know how many files we wrote into the queue that children read out of. Now read
+    #   same number of entries out of the processed data queue
+    for i in range( file_count ):
+        exif_timestamp_data = processed_file_queue.get()
+        file_data[ exif_timestamp_data['file_path']] = exif_timestamp_data
 
-            # Create TZ-aware datetime, as one should basically alwyys use
-            file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
+    logging.debug( f"Parent process has read out all {file_count} entries from results queue" )
 
-            #logging.debug( f"{curr_image_file}: {file_datetime_utc.isoformat()}")
-            file_data[ absolute_path ] = {
-                'datetime'  : file_datetime_utc
-            }
+    # Rejoin child threads
+    while process_handles:
+        curr_handle = process_handles.pop()
+        #logging.debug("parent process waiting for child worker to rejoin")
+        curr_handle.join()
+        #logging.debug("child process has rejoined cleanly")
 
-            display_file_index = file_index + 1
+    logging.debug("Parent process exiting, all EXIF timestamp work done")
 
-            if (display_file_index % display_increment_file_count == 0) or (display_file_index == file_count):
-                percent = int((display_file_index / file_count) * 100)
-                print( f"\tTimestamps: {display_file_index:>{col_width}d} / {file_count:>{col_width}d} ({percent:>3d}%)")
+    time_end = time.perf_counter()
 
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
-
-    print( f"Completed obtaining timestamps ({operation_time_seconds:.03f} seconds)" )
+    operation_time_seconds = time_end - time_start
 
     return {
         'file_data'                 : file_data,
         'operation_time_seconds'    : operation_time_seconds,
     }
+
+
+def _exif_timestamp_worker( child_process_index, files_to_process_queue, processed_file_queue, args ):
+    print( f"Child {child_process_index} started")
+
+    exiftool_tag_name = "EXIF:DateTimeOriginal"
+
+    with exiftool.ExifTool(args.exiftool_path) as exiftool_handle:
+
+        while True:
+            try:
+                # No need to wait, the queue was pre-loaded by the parent
+                curr_file_entry = files_to_process_queue.get( timeout=0.1 )
+            except queue.Empty:
+                # no more work to be done
+                #print( f"Child {child_process_index} found queue empty on get, bailing from processing loop")
+                break
+
+            # print(
+            #     f"Child {child_process_index} read processing entry from queue: {json.dumps(curr_file_entry, indent=4, sort_keys=True)}")
+
+            absolute_path = curr_file_entry['file_path']
+
+            exif_datetime = exiftool_handle.get_tag(exiftool_tag_name, absolute_path)
+
+            # Create legit datetime object from string, note: not tz aware (yet)
+            file_datetime_no_tz = datetime.datetime.strptime(exif_datetime, "%Y:%m:%d %H:%M:%S")
+
+            # Do hour shift from timezone-unaware EXIF datetime to UTC
+            shifted_datetime_no_tz = file_datetime_no_tz + datetime.timedelta(
+                hours=-(args.file_timestamp_utc_offset_hours))
+
+            # Create TZ-aware datetime, as one should basically always strive to use
+            file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
+
+            file_data = {
+                'file_path'         : absolute_path,
+                'filesize_bytes'    : curr_file_entry['filesize_bytes'],
+                'datetime'          : file_datetime_utc,
+            }
+
+            processed_file_queue.put( file_data )
+
+    #print( f"Child {child_process_index} exiting cleanly")
+
 
 
 def _add_perf_timing(perf_timings, label, value):
@@ -291,6 +345,7 @@ def _main():
 
     # Find EXIF dates for all source image files
     datetime_scan_output = _get_exif_datetimes( args, enumerate_output['image_files'] )
+
     _add_perf_timing( perf_timings, 'EXIF Timestamps', datetime_scan_output['operation_time_seconds'])
 
     # Determine unique filenames
