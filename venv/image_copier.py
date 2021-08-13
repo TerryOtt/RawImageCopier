@@ -41,6 +41,7 @@ def _enumerate_source_images(args, matching_file_extension):
                 file_absolute_path = os.path.join( args.source_dir, subdir, filename)
                 #logging.debug( "Found image with full path: \"{0}\"".format(file_absolute_path))
                 file_size_bytes = os.path.getsize(file_absolute_path)
+                #logging.debug(f"File size of {file_absolute_path}: {file_size_bytes}")
                 cumulative_bytes += file_size_bytes
                 image_files.append(
                     {
@@ -60,7 +61,7 @@ def _enumerate_source_images(args, matching_file_extension):
 
     operation_time_seconds = end_time - start_time
 
-    logging.debug( f"Enumerate time: {(operation_time_seconds):.03f} seconds" )
+    #logging.debug( f"Enumerate time: {(operation_time_seconds):.03f} seconds" )
 
     return {
         'image_files'               : image_files,
@@ -279,6 +280,8 @@ def _main():
     enumerate_output = _enumerate_source_images( args, matching_file_extension )
     _add_perf_timing( perf_timings, 'File Scan', enumerate_output['operation_time_seconds'] )
 
+    #logging.debug( f"Cumulative bytes: {enumerate_output['cumulative_bytes']}")
+
     print(
         "Found {0} files with extension \"{1}\" under \"{2}\", totalling {3:.01f} MB / {4:.01f} GB ({5:7.06f} seconds)".format(
         len(enumerate_output['image_files']), matching_file_extension, args.source_dir,
@@ -290,7 +293,7 @@ def _main():
     datetime_scan_output = _get_exif_datetimes( args, enumerate_output['image_files'] )
     _add_perf_timing( perf_timings, 'EXIF Timestamps', datetime_scan_output['operation_time_seconds'])
 
-    # Get file sizes, unique filenames
+    # Determine unique filenames
     file_data = datetime_scan_output['file_data']
     final_metadata = _set_destination_filenames( args, file_data )
     _add_perf_timing( perf_timings, 'Unique Destination Filenames', final_metadata['operation_time_seconds'])
