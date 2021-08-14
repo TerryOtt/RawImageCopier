@@ -237,7 +237,7 @@ def _set_unique_destination_filename( source_file, file_data, args, filename_con
         if os.path.isdir( year_subfolder) is True and os.path.isdir( year_date_subfolder ) is True:
             # TODO: Enumerate all matching files in the directory
             glob_match_str = f"{year_date_subfolder}/*{args.image_file_extension}"
-            logging.debug( f"Glob match string: {glob_match}")
+            logging.debug( f"Glob match string: {glob_match_str}")
 
             files_matching_glob = glob.glob( glob_match_str )
 
@@ -373,7 +373,7 @@ def _file_copy_worker( worker_index, files_to_copy_queue, args ):
 
         curr_source_file = curr_file_entry['file_path']
 
-        print( f"Worker {worker_index} doing copy for {curr_source_file}" )
+        #print( f"Worker {worker_index} doing copy for {curr_source_file}" )
 
         # Do we need to make either of the subfolders (YYYY/YYYY-MM-DD)?
         curr_folder = curr_file_entry['destination_subfolders']['date']
@@ -386,7 +386,7 @@ def _file_copy_worker( worker_index, files_to_copy_queue, args ):
         try:
             dest_path = curr_file_entry['unique_destination_file_path']
             shutil.copyfile(curr_source_file, dest_path)
-            print( f"Successful copy from {curr_source_file} to {dest_path}")
+            print( f"\"{curr_source_file}\" -> \"{dest_path}\" - OK OK OK")
 
         except:
             print(f"Exception thrown when copying {curr_file_entry['file_path']}" )
