@@ -10,6 +10,8 @@ import time
 import glob
 import multiprocessing
 import time
+import shutil
+import pathlib
 
 
 logging_level = logging.DEBUG
@@ -78,25 +80,19 @@ def _get_exif_datetimes( args, source_image_files ):
     time_start = time.perf_counter()
 
     file_data = {}
-
     file_count = len(source_image_files)
 
     print( f"Getting EXIF timestamps for {file_count} files")
-
-    col_width = len(str(file_count))
-
-    display_increment_file_count = 25
 
     start_time = time.perf_counter()
 
     process_handles = []
 
-    # Joinable Queue for sending files to process to children
+    #  Queue for sending files needing timestamps to children
     files_to_process_queue = multiprocessing.Queue(maxsize=file_count)
 
     # Queue that children use to write EXIF timestamp information data back to parent
     processed_file_queue = multiprocessing.Queue(maxsize=file_count)
-
 
     for i in range(num_worker_processes):
         process_handle = multiprocessing.Process( target=_exif_timestamp_worker,
@@ -119,7 +115,7 @@ def _get_exif_datetimes( args, source_image_files ):
         exif_timestamp_data = processed_file_queue.get()
         file_data[ exif_timestamp_data['file_path']] = exif_timestamp_data
 
-    logging.debug( f"Parent process has read out all {file_count} entries from results queue" )
+    #logging.debug( f"Parent process has read out all {file_count} entries from results queue" )
 
     # Rejoin child threads
     while process_handles:
@@ -128,7 +124,7 @@ def _get_exif_datetimes( args, source_image_files ):
         curr_handle.join()
         #logging.debug("child process has rejoined cleanly")
 
-    logging.debug("Parent process exiting, all EXIF timestamp work done")
+    #logging.debug("Parent process exiting, all EXIF timestamp work done")
 
     time_end = time.perf_counter()
 
@@ -141,7 +137,7 @@ def _get_exif_datetimes( args, source_image_files ):
 
 
 def _exif_timestamp_worker( child_process_index, files_to_process_queue, processed_file_queue, args ):
-    print( f"Child {child_process_index} started")
+    #print( f"Child {child_process_index} started")
 
     exiftool_tag_name = "EXIF:DateTimeOriginal"
 
@@ -313,10 +309,93 @@ def _set_destination_filenames( args, file_data ):
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
 
-    return {
-        'operation_time_seconds'        : operation_time_seconds,
-    }
+    return operation_time_seconds
 
+
+def _do_file_copies( args, file_data ):
+    time_start = time.perf_counter()
+
+    file_count = len( file_data.keys() )
+
+    print( f"Copying {file_count} image files to \"{args.destination_root}\"" )
+
+    #  Queue for sending information to worker processes about files needing to be copied
+    files_to_copy_queue = multiprocessing.JoinableQueue(maxsize=file_count)
+
+    process_handles = []
+
+    # Play with number of copy processes
+    copy_worker_count = 1
+
+    for i in range(copy_worker_count):
+
+        process_handle = multiprocessing.Process(target=_file_copy_worker,
+                                                 args=(i + 1, files_to_copy_queue,
+                                                       args))
+
+        process_handle.start()
+        # logging.debug(f"Parent back from start on child process {i+1}")
+        process_handles.append(process_handle)
+
+    # Load up the queue with all the files to copy
+    for curr_file_name in file_data:
+        # logging.debug(f"About to write {json.dumps(curr_file_info)} to the child queue")
+        files_to_copy_queue.put(file_data[curr_file_name] )
+
+    # Wait for children to finish copy, which will be signaled when last entry is marked done
+    files_to_copy_queue.join()
+
+    # Rejoin all child threads
+    while process_handles:
+        curr_handle = process_handles.pop()
+        curr_handle.join()
+
+    logging.debug( "All copy workers have rejoined cleanly" )
+
+    time_end = time.perf_counter()
+    operation_time_seconds = time_end - time_start
+
+    return operation_time_seconds
+
+
+def _file_copy_worker( worker_index, files_to_copy_queue, args ):
+
+    while True:
+        try:
+            # No need to wait, the queue was pre-loaded by the parent
+            curr_file_entry = files_to_copy_queue.get(timeout=0.1)
+        except queue.Empty:
+            # no more work to be done
+            print( f"Worker {worker_index} queue empty on get, bailing from processing loop")
+            break
+
+        #print( json.dumps( curr_file_entry, indent=4, sort_keys=True, default=str) )
+
+        curr_source_file = curr_file_entry['file_path']
+
+        print( f"Worker {worker_index} doing copy for {curr_source_file}" )
+
+        # Do we need to make either of the subfolders (YYYY/YYYY-MM-DD)?
+        curr_folder = curr_file_entry['destination_subfolders']['date']
+        try:
+            pathlib.Path( curr_folder ).mkdir( parents=True, exist_ok=True )
+        except:
+            print(f"Exception thrown in creating dirs for {curr_folder}")
+
+        # Attempt copy
+        try:
+            dest_path = curr_file_entry['unique_destination_file_path']
+            shutil.copyfile(curr_source_file, dest_path)
+            print( f"Successful copy from {curr_source_file} to {dest_path}")
+
+        except:
+            print(f"Exception thrown when copying {curr_file_entry['file_path']}" )
+
+        # Mark task done or parent will deadlock
+        files_to_copy_queue.task_done()
+
+
+    print( f"Worker {worker_index} exiting cleanly")
 
 
 def _main():
@@ -350,9 +429,12 @@ def _main():
 
     # Determine unique filenames
     file_data = datetime_scan_output['file_data']
-    final_metadata = _set_destination_filenames( args, file_data )
-    _add_perf_timing( perf_timings, 'Unique Destination Filenames', final_metadata['operation_time_seconds'])
+    set_destination_filenames_operation_time = _set_destination_filenames( args, file_data )
+    _add_perf_timing( perf_timings, 'Unique Destination Filenames', set_destination_filenames_operation_time )
 
+    # We can now (finally!) perform all file copies
+    copy_operation_time_seconds = _do_file_copies( args, file_data )
+    _add_perf_timing( perf_timings, 'File Copies to NAS', copy_operation_time_seconds )
 
 
     # Final perf print
