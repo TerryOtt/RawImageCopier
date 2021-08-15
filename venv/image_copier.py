@@ -321,6 +321,8 @@ def _geocode_images( args, file_data ):
 
     print("\tGPX file parsing complete")
 
+    feet_in_one_meter = 3.28084
+
     print("\n\tGeocoding all images")
     for curr_file_name in file_data:
         curr_file_data = file_data[curr_file_name]
@@ -332,7 +334,7 @@ def _geocode_images( args, file_data ):
                 'longitude_wgs84_degrees'             : computed_location[0].longitude,
                 'elevation_above_sea_level'     : {
                     'meters'    : computed_location[0].elevation,
-                    'feet'      : computed_location[0].elevation * 3.28084,
+                    'feet'      : computed_location[0].elevation * feet_in_one_meter,
                 },
             }
 
