@@ -12,6 +12,7 @@ import multiprocessing
 import time
 import shutil
 import pathlib
+import gpxpy
 
 
 logging_level = logging.DEBUG
@@ -26,6 +27,7 @@ def _parse_args():
     arg_parser.add_argument( "file_timestamp_utc_offset_hours",
                              help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is 4.5",
                              type=float)
+    arg_parser.add_argument( "gpx_file_path", help="Path to GPX file for geocoding these pictures")
     arg_parser.add_argument( "destination_root", help="Root of destination directory (e.g., \"Q:\Lightroom\Images\")")
 
     return arg_parser.parse_args()
@@ -34,7 +36,7 @@ def _parse_args():
 def _enumerate_source_images(args, matching_file_extension):
     image_files = []
     print(
-        f"Scanning \"{args.source_dir}\" for RAW image files with extension \"{matching_file_extension}\"")
+        f"\nScanning \"{args.source_dir}\" for RAW image files with extension \"{matching_file_extension}\"")
 
     start_time = time.perf_counter()
     cumulative_bytes = 0
@@ -82,7 +84,7 @@ def _get_exif_datetimes( args, source_image_files ):
     file_data = {}
     file_count = len(source_image_files)
 
-    print( f"Getting EXIF timestamps for {file_count} files")
+    print( f"\nStarting EXIF timestamp extraction for {file_count} files")
 
     start_time = time.perf_counter()
 
@@ -129,6 +131,8 @@ def _get_exif_datetimes( args, source_image_files ):
     time_end = time.perf_counter()
 
     operation_time_seconds = time_end - time_start
+
+    print( f"Completed EXIF timestamps extraction")
 
     return {
         'file_data'                 : file_data,
@@ -209,7 +213,7 @@ def _display_perf_timings( perf_timings ):
     print (f"\n\t{total_label:>{longest_label_len}s} : {perf_timings['total']:>7.03f} seconds" )
 
 
-def _set_unique_destination_filename( source_file, file_data, args, filename_conflict_dict,
+def _set_unique_destination_filename( source_file, file_data, args, matching_file_extension, filename_conflict_dict,
                                       destination_dirs_scanned ):
     #logging.debug( f"Setting destination filename for {source_file} under {args.destination_root}")
 
@@ -236,8 +240,8 @@ def _set_unique_destination_filename( source_file, file_data, args, filename_con
     if not year_date_subfolder in destination_dirs_scanned:
         if os.path.isdir( year_subfolder) is True and os.path.isdir( year_date_subfolder ) is True:
             # TODO: Enumerate all matching files in the directory
-            glob_match_str = f"{year_date_subfolder}/*{args.image_file_extension}"
-            logging.debug( f"Glob match string: {glob_match_str}")
+            glob_match_str = os.path.join( year_date_subfolder, f"*{matching_file_extension}" )
+            #logging.debug( f"Glob match string: {glob_match_str}")
 
             files_matching_glob = glob.glob( glob_match_str )
 
@@ -264,19 +268,18 @@ def _set_unique_destination_filename( source_file, file_data, args, filename_con
     index_append = None
 
     while test_file_path in filename_conflict_dict:
-        logging.debug ( f"\"{test_file_path}\" is a conflict")
         # Need to come up with a non-conflicting name
         if index_append is None:
             index_append = 1
         else:
             index_append += 1
 
-        test_file_path = os.path.join( year_date_subfolder, basename_minus_ext + f"-{index_append:04d}" +
-                                       file_extension )
+        next_attempt_name = os.path.join( year_date_subfolder,
+                                          basename_minus_ext + f"-{index_append:04d}" + file_extension )
 
-        #logging.debug( f"Found conflict, trying new name {test_file_path}")
+        logging.info( f"Found destination filename conflict with \"{test_file_path}\", trying \"{next_attempt_name}\"" )
 
-
+        test_file_path = next_attempt_name
 
     #logging.debug( f"Found unique destination filename: {test_file_path}")
     # Mark the final location for this file
@@ -288,7 +291,7 @@ def _set_unique_destination_filename( source_file, file_data, args, filename_con
     #logging.debug( f"Updated file info:\n{json.dumps(file_data, indent=4, sort_keys=True, default=str)}")
 
 
-def _set_destination_filenames( args, file_data ):
+def _set_destination_filenames( args, matching_file_extension, file_data ):
 
     start_time = time.perf_counter()
 
@@ -302,9 +305,8 @@ def _set_destination_filenames( args, file_data ):
         #logging.debug(f"\tSize: {file_size} bytes")
 
         _set_unique_destination_filename( curr_file, file_data[curr_file],
-            args, destination_filename_conflict_dict,
+            args, matching_file_extension, destination_filename_conflict_dict,
             destination_dirs_scanned )
-
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -312,12 +314,41 @@ def _set_destination_filenames( args, file_data ):
     return operation_time_seconds
 
 
+def _geocode_images( args, file_data ):
+    print( "\n\tReading GPX file" )
+    with open( args.gpx_file_path, "r" ) as gpx_file_handle:
+        gpx_data = gpxpy.parse( gpx_file_handle )
+
+    print("\tGPX file parsing complete")
+
+    print("\n\tGeocoding all images")
+    for curr_file_name in file_data:
+        curr_file_data = file_data[curr_file_name]
+        computed_location = gpx_data.get_location_at( curr_file_data['datetime'] )
+        if computed_location:
+            #logging.debug( f"Computed location: {computed_location}")
+            filedata_location = {
+                'latitude_wgs84_degrees'              : computed_location[0].latitude,
+                'longitude_wgs84_degrees'             : computed_location[0].longitude,
+                'elevation_above_sea_level'     : {
+                    'meters'    : computed_location[0].elevation,
+                    'feet'      : computed_location[0].elevation * 3.28084,
+                },
+            }
+
+            curr_file_data['geocoded_location'] = filedata_location
+
+            logging.debug( f"Set file's geolocated location to:\n{json.dumps(filedata_location, indent=4, sort_keys=True)}")
+        else:
+            print(f"WARN: Could not geocode file \"{curr_file_name}\"")
+    print("\tAll images geocoded" )
+
 def _do_file_copies( args, file_data ):
     time_start = time.perf_counter()
 
     file_count = len( file_data.keys() )
 
-    print( f"Copying {file_count} image files to \"{args.destination_root}\"" )
+    #print( f"Copying {file_count} image files to \"{args.destination_root}\"" )
 
     #  Queue for sending information to worker processes about files needing to be copied
     files_to_copy_queue = multiprocessing.JoinableQueue(maxsize=file_count)
@@ -366,7 +397,7 @@ def _file_copy_worker( worker_index, files_to_copy_queue, args ):
             curr_file_entry = files_to_copy_queue.get(timeout=0.1)
         except queue.Empty:
             # no more work to be done
-            print( f"Worker {worker_index} queue empty on get, bailing from processing loop")
+            #print( f"Worker {worker_index} queue empty on get, bailing from processing loop")
             break
 
         #print( json.dumps( curr_file_entry, indent=4, sort_keys=True, default=str) )
@@ -386,7 +417,7 @@ def _file_copy_worker( worker_index, files_to_copy_queue, args ):
         try:
             dest_path = curr_file_entry['unique_destination_file_path']
             shutil.copyfile(curr_source_file, dest_path)
-            print( f"\"{curr_source_file}\" -> \"{dest_path}\" - OK OK OK")
+            #print( f"\"{curr_source_file}\" -> \"{dest_path}\" - OK OK OK")
 
         except:
             print(f"Exception thrown when copying {curr_file_entry['file_path']}" )
@@ -394,8 +425,7 @@ def _file_copy_worker( worker_index, files_to_copy_queue, args ):
         # Mark task done or parent will deadlock
         files_to_copy_queue.task_done()
 
-
-    print( f"Worker {worker_index} exiting cleanly")
+    #print( f"Worker {worker_index} exiting cleanly")
 
 
 def _main():
@@ -411,7 +441,7 @@ def _main():
     }
 
     enumerate_output = _enumerate_source_images( args, matching_file_extension )
-    _add_perf_timing( perf_timings, 'File Scan', enumerate_output['operation_time_seconds'] )
+    _add_perf_timing( perf_timings, 'Scanning for RAW Files', enumerate_output['operation_time_seconds'] )
 
     #logging.debug( f"Cumulative bytes: {enumerate_output['cumulative_bytes']}")
 
@@ -424,21 +454,36 @@ def _main():
 
     # Find EXIF dates for all source image files
     datetime_scan_output = _get_exif_datetimes( args, enumerate_output['image_files'] )
+    file_data = datetime_scan_output['file_data']
+    _add_perf_timing( perf_timings, 'Obtaining EXIF Timestamps', datetime_scan_output['operation_time_seconds'])
 
-    _add_perf_timing( perf_timings, 'EXIF Timestamps', datetime_scan_output['operation_time_seconds'])
+    # Geocode all source image files based on their timestamp, the user-provided UTC hour offset, and the
+    #   user-provided GPX file
+    print( "\nStarting geocoding" )
+    geocoding_operation_time_seconds = _geocode_images( args, file_data )
+    print( "Geocoding complete")
 
     # Determine unique filenames
-    file_data = datetime_scan_output['file_data']
-    set_destination_filenames_operation_time = _set_destination_filenames( args, file_data )
-    _add_perf_timing( perf_timings, 'Unique Destination Filenames', set_destination_filenames_operation_time )
+    print( "\nGetting unique filenames in destination folder")
+    set_destination_filenames_operation_time = _set_destination_filenames( args, matching_file_extension, file_data )
+    print( "Unique file names in destination folder are set")
+    _add_perf_timing( perf_timings, 'Generating Unique Destination Filenames', set_destination_filenames_operation_time )
 
     # We can now (finally!) perform all file copies
+    print( "\nStarting file copies")
     copy_operation_time_seconds = _do_file_copies( args, file_data )
-    _add_perf_timing( perf_timings, 'File Copies to NAS', copy_operation_time_seconds )
+    print( "File copies completed")
+    _add_perf_timing( perf_timings, 'Copying Files to Destination', copy_operation_time_seconds )
 
 
     # Final perf print
     _display_perf_timings( perf_timings )
+
+    # Display TODOs to jog my brain
+    print( "\n\n******************************************************************************************\n"
+           "TODO: read in GPX file for this photo set, use the UTC offset passed in, geotag the photo,\n"
+           "      write to XMP sidecar file that Bridge/Lightroom/Capture One can use\n" 
+           "******************************************************************************************" )
 
 
 if __name__ == "__main__":
